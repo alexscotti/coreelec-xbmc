@@ -1139,27 +1139,68 @@ void CVideoPlayer::OpenDefaultStreams(bool reset)
   }
 
   PredicateVideoFilter vf(videoStreamPref);
-  for (const auto& stream : m_SelectionStreams.Get(StreamType::VIDEO, vf))
+  const auto videoStreams = m_SelectionStreams.Get(StreamType::VIDEO, vf);
+
+  // Two passes over the same ordered candidate list.
+  //
+  // Pass 0 refuses a stream that must never stand in for the feature:
+  //   - a Dolby Vision enhancement layer, which is one picture carried in two
+  //     streams rather than an alternative to choose between; and
+  //   - a Blu-ray SECONDARY VIDEO stream (PID 0x1b00-0x1b1f), the disc's
+  //     picture-in-picture track. The playlist's STN table does not list it as
+  //     video at all - CDVDInputStreamBluray::GetStreamInfo reports it as an
+  //     unhandled pid - so it is never the film. 30 Minutes or Less carries one
+  //     at 720x480 and it was being opened instead of the 1080p feature.
+  //
+  // Pass 1 drops both rules. A title whose only video stream is excluded - a
+  // pairing having flagged the wrong stream, say - then still plays, instead of
+  // coming up with no picture at all.
+  for (int pass = 0; pass < 2 && !valid; ++pass)
   {
-    // choose video base layer as default if dual layer stream
-    // only demuxer streams can be dual layer, nav and external streams are not
-    // known to the demuxer and must not be probed for it
-    if (m_pDemuxer && STREAM_SOURCE_MASK(stream.source) == STREAM_SOURCE_DEMUX)
+    for (const auto& stream : videoStreams)
     {
-      CDemuxStream* st = m_pDemuxer->GetStream(stream.demuxerId, stream.id);
-      if (st && st->type == StreamType::VIDEO)
+      // only demuxer streams can be dual layer, nav and external streams are not
+      // known to the demuxer and must not be probed for it
+      if (pass == 0 && m_pDemuxer && STREAM_SOURCE_MASK(stream.source) == STREAM_SOURCE_DEMUX)
       {
-        CDemuxStreamVideo* vstream = static_cast<CDemuxStreamVideo*>(st);
-        if (vstream->isDualStream && vstream->isELStream)
-          continue;
+        CDemuxStream* st = m_pDemuxer->GetStream(stream.demuxerId, stream.id);
+        if (st && st->type == StreamType::VIDEO)
+        {
+          const CDemuxStreamVideo* vstream = static_cast<const CDemuxStreamVideo*>(st);
+          if (vstream->isDualStream && vstream->isELStream)
+          {
+            CLog::Log(LOGDEBUG,
+                      "CVideoPlayer::OpenDefaultStreams - skipping video stream {} (pid {:#06x}): "
+                      "dual-layer enhancement layer",
+                      stream.id, vstream->dvdNavId);
+            continue;
+          }
+#if defined(HAVE_LIBBLURAY)
+          if (m_pInputStream && m_pInputStream->IsStreamType(DVDSTREAM_TYPE_BLURAY) &&
+              vstream->dvdNavId >= HDMV_PID_SECONDARY_VIDEO_FIRST &&
+              vstream->dvdNavId <= HDMV_PID_SECONDARY_VIDEO_LAST)
+          {
+            CLog::Log(LOGDEBUG,
+                      "CVideoPlayer::OpenDefaultStreams - skipping video stream {} (pid {:#06x}): "
+                      "bluray secondary video (picture-in-picture)",
+                      stream.id, vstream->dvdNavId);
+            continue;
+          }
+#endif
+        }
+      }
+
+      if (OpenStream(m_CurrentVideo, stream.demuxerId, stream.id, stream.source, reset))
+      {
+        valid = true;
+        break;
       }
     }
 
-    if (OpenStream(m_CurrentVideo, stream.demuxerId, stream.id, stream.source, reset))
-    {
-      valid = true;
-      break;
-    }
+    if (!valid && pass == 0)
+      CLog::Log(LOGDEBUG,
+                "CVideoPlayer::OpenDefaultStreams - no eligible video stream opened, retrying "
+                "without the enhancement-layer / secondary-video exclusions");
   }
   if (!valid)
   {

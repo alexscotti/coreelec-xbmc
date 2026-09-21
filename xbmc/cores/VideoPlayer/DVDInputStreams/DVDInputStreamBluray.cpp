@@ -24,6 +24,7 @@
 #include "cores/AudioEngine/Interfaces/AESound.h"
 #include "dialogs/GUIDialogKaiToast.h"
 #include "filesystem/BlurayCallback.h"
+#include "filesystem/Directory.h"
 #include "filesystem/File.h"
 #include "filesystem/SpecialProtocol.h"
 #include "settings/AdvancedSettings.h"
@@ -470,6 +471,42 @@ bool EffectiveDisplaySupports3D()
 }
 } // unnamed namespace
 
+/* A BD-J disc's own resume record can wedge it on this player.
+
+   Lionsgate's com.lge.radius menu engine (John Wick 3, measured) branches on
+   whether a resume record exists. With one, its state machine runs
+   ASSET_LOADER -> PRE_DUMMY -> RESUME instead of
+   ASSET_LOADER -> FBI -> LGE_LOGO -> VAM_DISCLAIMER -> TOP_MENU_CHECKPOINT ->
+   MAIN_MENU. RESUME is a terminal node in the disc's own state graph: it has
+   no successor edge, and its only exit is the "resumeMenu" presentation.
+
+   That presentation plays no playlist. With no playlist there is no
+   elementary stream, so VideoPlayer never opens a window, the BD-J overlay is
+   never composited, and key events never reach the disc. The menu is drawn
+   into a backbuffer nobody presents and the user sits on the busy dialog
+   forever - measured as "the player accepted the disc and never opened it".
+
+   The record is written whenever the feature is stopped part-way, so one
+   interrupted play poisons every subsequent one. Symphony owns resume - the
+   GUI decides where a film starts - so the disc's resume point is never
+   wanted here, and the menu that would consume it cannot be shown anyway.
+   Start every disc from clean BD-J persistent storage.
+
+   The cost is disc-side persistence generally, e.g. a disc's own bookmarks
+   menu: those are stored here too and do not survive. They are equally
+   unreachable whenever their menu plays no playlist. */
+static void ClearBdjPersistentStorage()
+{
+  const std::string dir =
+      CSpecialProtocol::TranslatePath("special://userdata/cache/bluray/persistent");
+  if (!XFILE::CDirectory::Exists(dir))
+    return;
+  if (XFILE::CDirectory::RemoveRecursive(dir))
+    CLog::Log(LOGDEBUG, "CDVDInputStreamBluray - cleared BD-J persistent storage {}", dir);
+  else
+    CLog::Log(LOGWARNING, "CDVDInputStreamBluray - could not clear BD-J persistent storage {}", dir);
+}
+
 bool CDVDInputStreamBluray::Open()
 {
   if(m_player == nullptr)
@@ -796,6 +833,8 @@ bool CDVDInputStreamBluray::Open()
     // IG button sound effects (sound.bdmv) - cache before playback so
     // BD_EVENT_SOUND_EFFECT can fire them with no load latency
     LoadMenuSounds();
+
+    ClearBdjPersistentStorage();
 
     if(bd_play(m_bd) <= 0)
     {
